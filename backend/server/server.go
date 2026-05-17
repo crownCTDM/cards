@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -24,20 +25,29 @@ type Client struct {
 }
 
 type Hub struct {
-	Clients    map[*Client]bool
-	Broadcast  chan []byte
-	Register   chan *Client
-	Unregister chan *Client
-	Game       *game.GameState
+	Clients            map[*Client]bool
+	Broadcast          chan []byte
+	Register           chan *Client
+	Unregister         chan *Client
+	Game               *game.GameState
+	Timeout            chan TimeoutEvent
+	EvaluateTrickEvent chan struct{}
+}
+
+type TimeoutEvent struct {
+	TurnCounter int
+	PlayerIndex int
 }
 
 func NewHub() *Hub {
 	return &Hub{
-		Broadcast:  make(chan []byte),
-		Register:   make(chan *Client),
-		Unregister: make(chan *Client),
-		Clients:    make(map[*Client]bool),
-		Game:       game.NewGame(),
+		Broadcast:          make(chan []byte),
+		Register:           make(chan *Client),
+		Unregister:         make(chan *Client),
+		Clients:            make(map[*Client]bool),
+		Game:               game.NewGame(),
+		Timeout:            make(chan TimeoutEvent),
+		EvaluateTrickEvent: make(chan struct{}),
 	}
 }
 
@@ -60,6 +70,55 @@ func (h *Hub) Run() {
 				default:
 					close(client.Send)
 					delete(h.Clients, client)
+				}
+			}
+		case event := <-h.Timeout:
+			if h.Game.Phase == game.PhasePlaying && h.Game.TurnCounter == event.TurnCounter {
+				err := h.Game.AutoPlay(event.PlayerIndex)
+				if err == nil {
+					log.Println("Auto-played for player", event.PlayerIndex)
+					h.broadcastState()
+
+					if len(h.Game.CurrentTrick.Cards) == 4 {
+						go func() {
+							time.Sleep(1000 * time.Millisecond)
+							h.EvaluateTrickEvent <- struct{}{}
+						}()
+					} else {
+						// Trigger next timer only if trick isn't full (evaluate handles the next timer otherwise)
+						tc := h.Game.TurnCounter
+						turn := h.Game.Turn
+						go func(counter, playerIdx int) {
+							time.Sleep(1 * time.Second)
+							h.Timeout <- TimeoutEvent{TurnCounter: counter, PlayerIndex: playerIdx}
+						}(tc, turn)
+					}
+				}
+			} else if (h.Game.Phase == game.PhasePenaltyVoteLoser || h.Game.Phase == game.PhasePenaltyVoteWinner || h.Game.Phase == game.PhasePenaltyReturnCard) && h.Game.TurnCounter == event.TurnCounter {
+				// Auto advance phase if timeout occurs
+				h.Game.AutoAdvancePhase()
+				h.broadcastState()
+
+				// Launch timer for the NEXT phase
+				tc := h.Game.TurnCounter
+				go func(counter int) {
+					time.Sleep(60 * time.Second)
+					h.Timeout <- TimeoutEvent{TurnCounter: counter, PlayerIndex: -1}
+				}(tc)
+			}
+		case <-h.EvaluateTrickEvent:
+			if len(h.Game.CurrentTrick.Cards) == 4 {
+				h.Game.EvaluateTrick()
+				h.broadcastState()
+
+				// Trigger next timer
+				if h.Game.Phase == game.PhasePlaying {
+					tc := h.Game.TurnCounter
+					turn := h.Game.Turn
+					go func(counter, playerIdx int) {
+						time.Sleep(1 * time.Second)
+						h.Timeout <- TimeoutEvent{TurnCounter: counter, PlayerIndex: playerIdx}
+					}(tc, turn)
 				}
 			}
 		}
@@ -94,10 +153,15 @@ func (c *Client) ReadPump() {
 		log.Printf("recv: %s", message)
 
 		var msg struct {
-			Type      string `json:"type"`
-			Name      string `json:"name"`
-			CardIndex int    `json:"cardIndex"`
-			Suit      string `json:"suit"`
+			Type        string `json:"type"`
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			PlayerID    string `json:"playerId"`
+			Team        int    `json:"team"`
+			CardIndex   int    `json:"cardIndex"`
+			Suit        string `json:"suit"`
+			VoterIndex  int    `json:"voterIndex"`
+			TargetIndex int    `json:"targetIndex"`
 		}
 
 		if err := json.Unmarshal(message, &msg); err != nil {
@@ -105,25 +169,83 @@ func (c *Client) ReadPump() {
 			continue
 		}
 
+		// Check if turn changed to trigger timer
+		oldTurnCounter := c.Hub.Game.TurnCounter
+
 		switch msg.Type {
 		case "join":
-			// Simple join logic - add player
-			// In real app, associate Client with Player
-			err := c.Hub.Game.AddPlayer("uuid-placeholder", msg.Name)
+			err := c.Hub.Game.AddPlayer(msg.ID, msg.Name)
 			if err != nil {
 				log.Println("Join error:", err)
 			}
+		case "set_team":
+			err := c.Hub.Game.AssignTeam(msg.PlayerID, game.TeamID(msg.Team))
+			if err != nil {
+				log.Println("AssignTeam error:", err)
+			}
+		case "start_game":
+			err := c.Hub.Game.Start()
+			if err != nil {
+				log.Println("Start error:", err)
+			}
+		case "set_trump":
+			err := c.Hub.Game.SetTrump(game.Suit(msg.Suit))
+			if err != nil {
+				log.Println("SetTrump error:", err)
+			}
 		case "play":
-			// Need to know which player this client is
-			// For prototype, assuming single player controlling all or 1:1 mapping if possible
-			// Let's assume Turn based play
 			err := c.Hub.Game.PlayCard(c.Hub.Game.Turn, msg.CardIndex)
 			if err != nil {
 				log.Println("Play error:", err)
+			} else {
+				// Broadcast state immediately so the 4th card is visible
+				c.Hub.broadcastState()
+
+				if len(c.Hub.Game.CurrentTrick.Cards) == 4 {
+					go func() {
+						time.Sleep(1000 * time.Millisecond)
+						c.Hub.EvaluateTrickEvent <- struct{}{}
+					}()
+				}
+			}
+		case "reset_game":
+			err := c.Hub.Game.Reset()
+			if err != nil {
+				log.Println("Reset error:", err)
+			}
+		case "next_round":
+			err := c.Hub.Game.NextRound()
+			if err != nil {
+				log.Println("NextRound error:", err)
+			}
+		case "vote_loser":
+			err := c.Hub.Game.VoteLoser(msg.VoterIndex, msg.TargetIndex)
+			if err != nil {
+				log.Println("VoteLoser error:", err)
+			}
+		case "vote_winner":
+			err := c.Hub.Game.VoteWinner(msg.VoterIndex, msg.TargetIndex)
+			if err != nil {
+				log.Println("VoteWinner error:", err)
+			}
+		case "return_card":
+			err := c.Hub.Game.ReturnCard(msg.VoterIndex, msg.CardIndex)
+			if err != nil {
+				log.Println("ReturnCard error:", err)
 			}
 		}
 
 		c.Hub.broadcastState()
+
+		// If a valid move/change occurred during Playing phase, launch a timer
+		if (c.Hub.Game.Phase == game.PhasePlaying || c.Hub.Game.Phase == game.PhasePenaltyVoteLoser || c.Hub.Game.Phase == game.PhasePenaltyVoteWinner || c.Hub.Game.Phase == game.PhasePenaltyReturnCard) && c.Hub.Game.TurnCounter > oldTurnCounter {
+			tc := c.Hub.Game.TurnCounter
+			turn := c.Hub.Game.Turn
+			go func(counter, playerIdx int) {
+				time.Sleep(1 * time.Second)
+				c.Hub.Timeout <- TimeoutEvent{TurnCounter: counter, PlayerIndex: playerIdx}
+			}(tc, turn)
+		}
 	}
 }
 
@@ -131,24 +253,18 @@ func (c *Client) WritePump() {
 	defer func() {
 		c.Conn.Close()
 	}()
-	for {
-		select {
-		case message, ok := <-c.Send:
-			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			w, err := c.Conn.NextWriter(websocket.TextMessage)
-			if err != nil {
-				return
-			}
-			w.Write(message)
+	for message := range c.Send {
+		w, err := c.Conn.NextWriter(websocket.TextMessage)
+		if err != nil {
+			return
+		}
+		w.Write(message)
 
-			if err := w.Close(); err != nil {
-				return
-			}
+		if err := w.Close(); err != nil {
+			return
 		}
 	}
+	c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
 }
 
 func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {

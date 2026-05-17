@@ -8,41 +8,63 @@ export interface Player {
     Team: number;
 }
 
-export type Phase = 'Waiting' | 'TrumpSelection' | 'Playing' | 'GameOver';
+export type Phase = 'Lobby' | 'TrumpSelection' | 'Playing' | 'GameOver' | 'PenaltyVoteLoser' | 'PenaltyVoteWinner' | 'PenaltyReturnCard';
 
 export interface GameState {
     Players: Player[];
     Phase: Phase;
+    HostID: string;
     TrumpSuit: Suit;
     TrumpCaller: number;
     Turn: number;
+    TurnCounter: number;
     CurrentTrick: {
         Cards: { suit: Suit; rank: Rank }[];
         Leader: number;
     };
     TeamAScore: number;
     TeamBScore: number;
+    
+    // Advanced Mechanics State
+    RoundsPlayed: number;
+    TradeAmount: number;
+    TradeIndex: number;
+    LosingTeam: number;
+    WinningTeam: number;
+    Votes: { [voterIdx: number]: number };
+    TradeGiver: number;
+    TradeReceiver: number;
 }
 
 export const useGameWebSocket = (url: string) => {
     const [gameState, setGameState] = useState<GameState | null>(null);
+    const [myPlayerId, setMyPlayerId] = useState<string>('');
     const ws = useRef<WebSocket | null>(null);
 
     useEffect(() => {
+        // Generate or retrieve a persistent session ID for reconnection
+        let savedId = localStorage.getItem('playerId');
+        if (!savedId) {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+                savedId = crypto.randomUUID();
+            } else {
+                // Fallback for HTTP network IPs where crypto.randomUUID is disabled
+                savedId = 'user_' + Math.random().toString(36).substring(2, 15);
+            }
+            localStorage.setItem('playerId', savedId);
+        }
+        setMyPlayerId(savedId);
+
         ws.current = new WebSocket(url);
 
         ws.current.onopen = () => {
             console.log('Connected to WebSocket');
-            // Auto-join for demo
-            ws.current?.send(JSON.stringify({ type: 'join', name: 'Player' + Math.floor(Math.random() * 100) }));
+            // No auto-join, must call connectGame explicitly
         };
 
         ws.current.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-                // Assuming backend sends raw GameState directly for now
-                // Or wrapped in type
-                // For prototype, let's assume raw state if valid, or handle specific message types
                 setGameState(data);
             } catch (e) {
                 console.error('Error parsing message', e);
@@ -50,7 +72,7 @@ export const useGameWebSocket = (url: string) => {
         };
 
         ws.current.onclose = () => {
-            console.log('Disconnected');
+            console.log('Disconnected from WebSocket');
         };
 
         return () => {
@@ -64,5 +86,9 @@ export const useGameWebSocket = (url: string) => {
         }
     };
 
-    return { gameState, sendAction };
+    const connectGame = (name: string) => {
+        sendAction({ type: 'join', id: myPlayerId, name });
+    };
+
+    return { gameState, sendAction, connectGame, myPlayerId };
 };
